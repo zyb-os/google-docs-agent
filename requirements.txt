@@ -1,0 +1,12 @@
+# WebSocket + HTTP client (orchestrator connection)
+httpx>=0.27.0
+websockets>=12.0
+
+# MCP client library — communicates with the Google Drive MCP server subprocess
+mcp>=1.0.0
+
+# Google API client — used for create/update operations (Docs REST API)
+google-api-python-client>=2.120.0
+google-auth>=2.29.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
