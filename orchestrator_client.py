@@ -260,6 +260,27 @@ REGISTRATION_PAYLOAD: dict = {
     ],
 }
 
+# ── Readiness ──────────────────────────────────────────────────────────────────
+# Settings / files that MUST be present before this agent can accept traffic.
+# For this agent readiness depends on physical OAuth credential files on disk
+# (the paths themselves are configurable via settings).
+# key → (human label, setup instruction)
+_REQUIRED_SETTINGS: dict[str, tuple[str, str]] = {
+    "credentials_file": (
+        "Google OAuth Credentials File (credentials.json)",
+        "Go to https://console.cloud.google.com → APIs & Services → Credentials, "
+        "create an OAuth 2.0 Client ID (Desktop app), download the JSON, and save it as "
+        "'credentials.json' in the agent directory (or the path set in gdocs_credentials_file). "
+        "Then run 'python setup_oauth.py' to complete the OAuth flow and generate token.json.",
+    ),
+    "token_file": (
+        "Google OAuth Token File (token.json)",
+        "Run 'python setup_oauth.py' in the agent directory. This opens a browser, "
+        "asks you to sign in with Google, and saves token.json automatically. "
+        "You only need to do this once — the token refreshes on its own.",
+    ),
+}
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 HEARTBEAT_INTERVAL_S: int = 15
@@ -323,6 +344,9 @@ class OrchestratorClient:
         self._shutting_down: bool    = False
         self._current_ws:    Any     = None
 
+        # Readiness: keys of _REQUIRED_SETTINGS that are not yet satisfied
+        self._missing_required: list[str] = list(_REQUIRED_SETTINGS.keys())
+
         self._gdocs = GDocsMCPClient()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -352,6 +376,7 @@ class OrchestratorClient:
             **data.get("agent_settings", {}),
         }
         self._gdocs.update_settings(self._common_settings)
+        self._check_readiness()
         logger.info("Registered — agent_id=%s  ws=%s", self._agent_id, self._ws_url)
 
     # ── WebSocket loop ─────────────────────────────────────────────────────────
@@ -390,10 +415,64 @@ class OrchestratorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF_S)
 
+    # ── Readiness helpers ──────────────────────────────────────────────────────
+
+    def _check_readiness(self) -> None:
+        """Check whether the required OAuth credential files exist on disk."""
+        creds_path  = Path(self._common_settings.get("gdocs_credentials_file", "credentials.json"))
+        token_path  = Path(self._common_settings.get("gdocs_token_file", "token.json"))
+
+        missing: list[str] = []
+        if not creds_path.exists():
+            missing.append("credentials_file")
+        if not token_path.exists():
+            missing.append("token_file")
+
+        was_unready = bool(self._missing_required)
+        self._missing_required = missing
+
+        if missing:
+            labels = [_REQUIRED_SETTINGS[k][0] for k in missing]
+            logger.warning(
+                "Agent NOT READY — missing OAuth files: %s. "
+                "Run 'python setup_oauth.py' to complete the setup.",
+                ", ".join(labels),
+            )
+            # Reflect the error state immediately if a WS session is active
+            self._status = "error"
+        elif was_unready:
+            logger.info("All required OAuth files are present — agent is READY")
+            if self._current_ws:
+                self._status = "available"
+
+    def _not_ready_payload(self) -> dict:
+        """Build the structured error payload returned to callers when not ready."""
+        details = []
+        for key in self._missing_required:
+            label, instruction = _REQUIRED_SETTINGS[key]
+            details.append({"setting": key, "label": label, "how_to_set": instruction})
+        return {
+            "error_code": "AGENT_NOT_READY",
+            "message": (
+                f"Agent '{AGENT_NAME}' is not ready to accept traffic. "
+                f"The following required OAuth files are missing: "
+                f"{', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}."
+            ),
+            "missing_settings": details,
+            "resolution": (
+                "1. Download credentials.json from the Google Cloud Console "
+                "(APIs & Services → Credentials → OAuth 2.0 Client IDs). "
+                "2. Run 'python setup_oauth.py' in the agent directory to generate token.json. "
+                "The agent will automatically transition to 'available' once both files are present."
+            ),
+        }
+
+    # ── WebSocket session ──────────────────────────────────────────────────────
+
     async def _run_session(self, ws) -> None:
         self._current_ws = ws
-        self._status     = "available"
-        logger.info("WebSocket session active")
+        self._status     = "error" if self._missing_required else "available"
+        logger.info("WebSocket session active (status=%s)", self._status)
         try:
             await asyncio.gather(
                 self._heartbeat_loop(ws),
@@ -407,15 +486,18 @@ class OrchestratorClient:
 
     async def _heartbeat_loop(self, ws) -> None:
         while True:
-            await self._ws_send(ws, self._msg(
-                "heartbeat",
-                {
-                    "status":       self._status,
-                    "current_load": min(self._active_tasks / 5.0, 1.0),
-                    "active_tasks": self._active_tasks,
-                    "metrics":      self._metrics(),
-                },
-            ))
+            hb_payload: dict[str, Any] = {
+                "status":       self._status,
+                "current_load": min(self._active_tasks / 5.0, 1.0),
+                "active_tasks": self._active_tasks,
+                "metrics":      self._metrics(),
+            }
+            if self._missing_required:
+                hb_payload["error_message"] = (
+                    f"Missing required OAuth files: "
+                    f"{', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}"
+                )
+            await self._ws_send(ws, self._msg("heartbeat", hb_payload))
             await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
     # ── Receive loop ───────────────────────────────────────────────────────────
@@ -444,6 +526,7 @@ class OrchestratorClient:
             self._common_settings.update(pushed)
             self._gdocs.update_settings(self._common_settings)
             logger.info("Settings updated via push: %s", list(pushed.keys()))
+            self._check_readiness()
 
         elif mtype in ("agent_registered", "agent_offline"):
             logger.debug("Peer event [%s]: %s", mtype, payload.get("agent_id"))
@@ -460,6 +543,29 @@ class OrchestratorClient:
     # ── Task handling ──────────────────────────────────────────────────────────
 
     async def _handle_task(self, ws, msg: dict) -> None:
+        # Refuse traffic immediately if required OAuth files are missing.
+        if self._missing_required:
+            await self._ws_send(ws, self._msg(
+                "task_response",
+                {
+                    "success": False,
+                    "error": (
+                        f"AGENT_NOT_READY: {AGENT_NAME} cannot accept traffic until "
+                        f"required OAuth files are present. "
+                        f"Missing: {', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}."
+                    ),
+                    "output_data": self._not_ready_payload(),
+                    "duration_ms": 0,
+                },
+                recipient_id=msg.get("sender_id"),
+                correlation_id=msg.get("id"),
+            ))
+            logger.warning(
+                "Rejected task (capability=%s) — agent not ready",
+                msg.get("payload", {}).get("capability"),
+            )
+            return
+
         req_id     = msg.get("id")
         sender_id  = msg.get("sender_id")
         payload    = msg.get("payload", {})
